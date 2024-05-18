@@ -1,0 +1,260 @@
+---
+title: "Predicting number of deaths using seasonal models"
+format: pdf
+editor: visual
+fig-pos: 'H'
+tab-pos: 'H'
+crossref:
+  fig-title: Image
+  tbl-title: Table
+  fig-prefix: Image
+  tbl-prefix: Table
+  eq-prefix: ""
+---
+
+## Introduction
+
+In this short project we will try to predict number of deaths caused by lung diseases. For the time series, we will select the *ldeaths* database from the *datasets* package, which contains data on the number of deaths from lung diseases in the United Kingdom. Given the large number of lung diseases, this database covers the number of deaths from bronchitis, asthma, or emphysema. The database itself is created by merging two databases, *mdeaths* and *fdeaths* which contain the same data separately for males and females. The data were collected from January 1974 to December 1979.
+
+```{r}
+#| include: false
+# Loading packages and including them
+library(tidyverse)
+library(tsibble)
+library(feasts)
+library(astsa)
+library(TSA)
+library(tsibbledata)
+library(lubridate)
+library(ggplot2)
+library(fable)
+library(tseries)
+library(fpp3)
+library(vtable)
+library(fpp2)
+library(gt)
+library(readxl)
+library(fGarch)
+library(dplyr)
+```
+
+```{r}
+#| echo: false
+# Loading dataset
+
+smrti <- datasets::ldeaths
+
+```
+
+## Data Preprocessing and Exploatory Data Analysis
+
+Next we move onto data preprocessing and short exploatory data analysis. If we take a closer look we can see that our data is a time series object. These are vector or matrices with class of *ts* which represent data which has been sampled at equispaced points in time. Next, we will turn *ts* object into *tsibble* object which preserves time indices as the essential data column and makes heterogeneous data structures possible.
+
+```{r}
+
+smrti
+class(smrti)
+# dataset is given as "ts" object so we will turn it into "tsibble" object
+
+smrti <- as_tsibble(smrti)
+
+```
+
+As mentioned in Introduction, the data were collected from January 1974. to December 1979. This gives us a total of $72$ observations. In order to predict number of deaths in future we shall select test data which will then be used for prediction. Because of that we will observe time period from January 1974. to December of 1978.
+
+```{r}
+
+smrti_m <- smrti |> filter_index(.~"1978-12")
+smrti_m
+```
+
+Now we move on to some numerical characteristics of ours time series. As we can see, down below, minimal number of monthly deaths from lung diseasses in UK was 1300 people while maximum number of deaths in a single month is equal to 3891. Average number of monthly deaths is 2086 and median is 1920. Also, standard deviation is equal to 617.5449.
+
+```{r}
+
+summary(smrti_m$value)
+sd(smrti_m$value)
+```
+
+If we take a closer look at graphical representation of observed time series given in @fig-1 we can see that there is no linear trend but there is some seasonality. As we can see number of deaths is highest in winter months and they begin to drop with spring and summer months. Autumn brings a renewed increase in number of deaths.
+
+```{r}
+#| echo: false
+#| label: fig-1
+#| fig-cap: "Monthly number of deaths from lung diseases in United Kingdom."
+
+ggplot(smrti_m, aes(x = index, y = value)) + geom_line() + labs(x = "Time", y = "No. of deaths")
+
+```
+
+This can be better seen if we look at @fig-2. We can easily see peaks around February and March of each year followed by strong decrease of deaths up until August. After that, there is a resurgence in the number of deaths as we have already seen.
+
+```{r}
+#| echo: false
+#| label: fig-2
+#| fig-cap: "Monthly number of deaths from lung diseases in United Kingdom for each year."
+
+smrti_m |> gg_season(value, period = "year") + labs(x = "Time", y = "No. of deaths")
+
+```
+
+In order to successfully model the observed time series, we need to check whether the data is stationary. In order to do this, we will look at the autocorrelation function, whose graphic representation can be seen on @fig-3.
+
+```{r}
+#| echo: false
+#| label: fig-3
+#| fig-cap: "Autocorrelation function of monthly number of deaths from lung diseases in United Kingdom."
+
+ggAcf(smrti_m, lag.max = 36) + labs(title = "")
+```
+
+As mentioned before, we can easily see seasonality among data, and the correlations at steps $12, 24, 36, \dots$ very slowly decrease to zero. This tells us that we can doubt the stationarity of data and that we should differentiate it. In order to remove seasonality, we will differentiate the data at step $12.$ Note that in this case there is no need to test the assumptions about the existence of a unit root, which could consequently also lead to differentiation at the first step, using the extended Dickey - Fuller unit root test and KPSS test because the data does not show any trend. We can verify this by using the *unitroot_ndiffs* function from the *feasts* package, which gives us $0.$ for the required number of differentiations at the first step.
+
+```{r}
+smrti_m <- smrti_m |> mutate(d12 = difference(value, 12))
+smrtid12_m<-na.omit(smrti_m)
+
+# How many times should we differentiate at step 1?
+smrti_m |> features(value, unitroot_ndiffs)
+# No need to differentiate at step 1
+
+smrti_m |>features(value, unitroot_nsdiffs)
+# It is enough to differentiate once on step 12
+```
+
+After differentiation at step $12$, @fig-4-1 clearly shows us that there is no more seasonality among the data, and in @fig-4-2 we can see that most of the correlations are not significant, but still we cannot ignore the correlations at steps $10$ and $12$. Although we have two significant correlations, the *unitroot_nsdiffs* function suggests that one differentiation of the data is sufficient.
+
+```{r}
+#| echo: false
+#| label: fig-4
+#| fig-cap: " Graphical representation of"
+#| fig-subcap: 
+#|    - "after differentiation at step 12."
+#|    - "autocorrelation function of differentiated data."
+#| layout: [[45,-10, 45], [100]]
+
+ggplot(smrtid12_m, aes(x = index, y = d12)) + geom_line() + labs(x = "Vrijeme", y = "Diferencirane vrijednosti")
+
+ggAcf(difference(smrti_m$value,12), lag.max = 36) + labs(title = "")
+```
+
+## Models and Diagnostics
+
+Since we are dealing with seasonal data, we will search for suitable models among $\text{SARIMA}(p,d,q)\times(P,D,Q)_{\text{s}}$ processes. In previous analyses, it was very easy to notice that the period $\text{s} = 12$. Also, considering that we have differentiated the data at a step of $12$, when searching for the first and second models, we will fix $d = 0,\ D=1$. Additionally, when searching for the second model, we will include a stepwise procedure. Let us note that all models will be chosen based on the smallest Akaike Information Criterion (AIC).
+
+### First model
+
+As previously stated, when searching for the first model, we set $d = 0,\ D = 1$, and utilize functions from the *fable* package to identify the optimal model based on the Akaike Information Criterion.
+
+```{r}
+
+m1<- smrti_m |> model(m1 = ARIMA(value ~ pdq(d=0) + PDQ(D=1),stepwise = F))
+
+report(m1)
+
+# suggested model is SARIMA(2,0,0)x(1,1,0)_12 with drift
+# AIC=692.14   AICc=693.57   BIC=701.5
+```
+
+Consequently, we acquire the model $\text{SARIMA}(2,0,0)\times(1,1,0)_{12}$ with a drift component, yielding an AIC of $692.14$. Now, let's focus onto the estimated coefficients for this model which can be seen below.
+
+```{r}
+
+tidy(m1)
+```
+
+It's easy to notice that all coefficients, except the first one, are significant for this model. Furthermore, looking at the autocorrelation function of residuals in @fig-5, we can see that there is no significant correlations at any lag. Conducting the Ljung-Box test on the residuals, with a p-value of $0.46877$, suggests that we can assert the absence of correlated residuals. However, the Shapiro-Wilk test, yielding a p-value of $3.173\text{e}-09$, leads us to reject the hypothesis of normality in the residuals' distribution.
+
+```{r}
+#| echo: false
+#| label: fig-5
+#| fig-cap: "Residuals of the first model, their autocorrelation function and histogram."
+#| 
+gg_tsresiduals(m1)
+```
+
+```{r}
+augment(m1) |>
+features(.innov, ljung_box, lag = 24, dof = nrow(tidy(m1)))
+
+shapiro.test(augment(m1)$.innov)
+
+
+```
+
+### Second model
+
+For the second model, we will repeat the analogous procedure as for selecting the first model, but this time we will include the stepwise procedure. As a result, we obtain the model $\text{SARIMA}(0,0,2)\times(1,1,0)_{12}$ also with a drift, with an Akaike Information Criterion of $693.32$, making it slightly inferior to the model obtained without the inclusion of the stepwise procedure. Unlike the first model, in this case, we have two coefficients that are not significant, as easily observed in the following code output.
+
+```{r}
+
+
+m2<- smrti_m |> model(m2=ARIMA(value ~ pdq(d=0)+PDQ(D=1),stepwise=T))
+report(m2)
+
+# suggested model SARIMA(0,0,2)x(1,1,0)_12 with drift
+
+tidy(m2)
+
+```
+
+Similarly as before, we will analyze the residuals. On @fig-6 we see how the residuals are quite similar to those shown on @fig-5. We can see that there are no significant correlations, which is confirmed by the Ljung-Box test with a p-value of $0.584472$. If we perform the Shapiro-Wilk test, we get a p-value of $2.884\text{e}-09$, so we reject the hypothesis of a normal distribution of residuals.
+
+```{r}
+#| echo: false
+#| label: fig-6
+#| fig-cap: "Residuals of the second model, their autocorrelation function and histogram."
+#| 
+gg_tsresiduals(m2)
+```
+
+```{r}
+augment(m2) |>
+features(.innov, ljung_box, lag = 24, dof = nrow(tidy(m2)))
+
+shapiro.test(augment(m2)$.innov)
+```
+
+## Forecasting
+
+Finaly, we can make prediction for each of our models. For that we will use *forecast* function and make prediction for the next 12 months. After we've done that we will compare them and see which one is better.
+
+```{r}
+
+modeli_smrt <- bind_cols(m1, m2)
+modeli_smrt
+
+pred1 <- modeli_smrt |>
+forecast(h = 12)
+```
+
+In @fig-7-1 we see the forecast for the next $12$ months based on two selected models with actual values displayed. For simplicity we will focus on @fig-7-2 where we see the actual values and predictions for each model, but without the prior values.
+
+```{r}
+
+#| echo: false
+#| label: fig-7
+#| fig-cap: "Graphical representation of"
+#| fig-subcap: 
+#|    - "prediction for both models."
+#|    - "detailed prediction for both models."
+#| layout: [[45,-10, 45], [100]]
+
+pred1 |> autoplot() +
+autolayer(smrti, value) 
+
+pred1 |> autoplot(level = NULL) +
+geom_point(data = smrti |> filter_index("1979.01" ~ .), aes(y = value))
+```
+
+We can easily see a great similarity in the forecast between the first (m1) and second (m2) model, which almost perfectly follow real values in the period from April to June, but in the other months they tend to deviate.
+
+```{r}
+fabletools::accuracy(pred1,smrti) 
+```
+
+In the table above, we see some coefficients that are used when determining the accuracy of a particular model, and we obtained them using the accuracy function. We observe that the $\text{SARIMA}(0,0,2)\times(1,1,0)_{12}$ model proved to be the most accurate. We can see the graphic representation at Image 7 (b) in blue and its formula is given with
+
+$$
+(1+0.5715B^{12})X_t = (1-0.2210B+0.2941B^2)Z_t - 102.5034.
+$$
